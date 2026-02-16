@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-from __future__ import annotations
+"""Parse policy commands and emit structured JSON."""
 
 import argparse
 import json
@@ -248,7 +248,7 @@ def precedence_for_rule(rule_name: str, bindings: Iterable[Dict[str, Any]], fall
     return fallback
 
 
-def refchg_and_thr(rule_name: str, rule_data: Dict[str, Any]) -> tuple[str, str]:
+def refchg_and_thr(rule_name: str, rule_data: Dict[str, Any]) -> Tuple[str, str]:
     policy_group = rule_data.get("PCCPOLICYGRP") or {}
     ref_chg = None
     thr_source = None
