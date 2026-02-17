@@ -4,10 +4,14 @@
 import argparse
 import json
 import re
+from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 ATTR_REGEX = re.compile(r"(\w+)=\"([^\"]*)\"|(\w+)=([^,;]+)")
+TIMESTAMP_FORMAT = "%Y%m%d%H%M%S"
+DEFAULT_RULESET_MAP = Path("ruleset_mapping_template.json")
+DEFAULT_OUTPUT_TEMPLATE = "{stem}_MAV_{timestamp}"
 
 
 def normalize_rule_name(name: str) -> str:
@@ -264,6 +268,51 @@ def refchg_and_thr(rule_name: str, rule_data: Dict[str, Any]) -> Tuple[str, str]
     return ref_chg, thr_source
 
 
+def monitoring_key_for_rule(rule_data: Dict[str, Any]) -> Optional[Any]:
+    key = rule_data.get("MONITORINGKEY")
+    if key is not None:
+        return key
+    policy_group = rule_data.get("PCCPOLICYGRP")
+    if isinstance(policy_group, dict):
+        return policy_group.get("MONITORINGKEY")
+    return None
+
+
+def collect_filter_names(rule_data: Dict[str, Any]) -> List[str]:
+    names: List[str] = []
+    for entry in rule_data.get("FLTBINDFLOWF", []) or []:
+        if isinstance(entry, dict):
+            name = entry.get("FILTERNAME")
+            if isinstance(name, str):
+                names.append(name)
+    for entry in rule_data.get("PROTBINDFLOWF", []) or []:
+        if isinstance(entry, dict):
+            name = entry.get("L7FILTERNAME")
+            if isinstance(name, str):
+                names.append(name)
+    deduped: List[str] = []
+    seen = set()
+    for name in names:
+        if name not in seen:
+            seen.add(name)
+            deduped.append(name)
+    return deduped
+
+
+def rating_group_from_charge(charge_name: str) -> str:
+    match = re.search(r"(\d+)$", charge_name)
+    if match:
+        return match.group(1)
+    return "xxxxxxxxxx"
+
+
+def charging_data_label(charge_name: str) -> str:
+    match = re.match(r"^(.*?)(?:_\d+)$", charge_name)
+    if match:
+        return match.group(1)
+    return charge_name
+
+
 def needs_dual_usage_reporting(rule_data: Dict[str, Any]) -> Optional[str]:
     policy_group = rule_data.get("PCCPOLICYGRP")
     if not isinstance(policy_group, dict):
@@ -292,19 +341,22 @@ def needs_dual_usage_reporting(rule_data: Dict[str, Any]) -> Optional[str]:
     return thr_source
 
 
-def render_rule(rule_set: str, rule_name: str, rule_data: Dict[str, Any], bindings: List[Dict[str, Any]]) -> List[str]:
+def render_rule(
+    rule_set: str, rule_name: str, rule_data: Dict[str, Any], bindings: List[Dict[str, Any]]
+) -> Tuple[List[str], str, str]:
     if not rule_set:
         raise ValueError(f"Rule {rule_name} missing ruleSet identifier")
     precedence = precedence_for_rule(rule_name, bindings, rule_data.get("PRIORITY"))
     ref_chg, thr_source = refchg_and_thr(rule_name, rule_data)
     safe_rule_name = normalize_rule_name(rule_name)
-    return [
+    commands = [
         f"set SMFFunction Policy smfpolicy ruleSets {rule_set} rules {safe_rule_name} precedence {precedence}",
         f"set SMFFunction Policy smfpolicy ruleSets {rule_set} rules {safe_rule_name} refChgData {ref_chg}",
         f"set SMFFunction Policy smfpolicy ruleSets {rule_set} rules {safe_rule_name} trafficHandlingRules [ thr_{thr_source} ]",
         f"set SMFFunction Policy smfpolicy ruleSets {rule_set} rules {safe_rule_name} status active",
         f"set SMFFunction Policy smfpolicy ruleSets {rule_set} rules {safe_rule_name} tethering false",
     ]
+    return commands, thr_source, ref_chg
 
 
 def build_command_list(profiles: List[Dict[str, Any]]) -> Tuple[List[str], List[str]]:
@@ -312,6 +364,9 @@ def build_command_list(profiles: List[Dict[str, Any]]) -> Tuple[List[str], List[
     errors: List[str] = []
     next_online_urr = 101
     next_offline_urr = 301
+    next_monitoring_urr = 501
+    next_pdr_id = 601
+    emitted_charging_data: Set[str] = set()
     for profile in profiles:
         user_profile = profile.get("USERPROFILENAME", "")
         rule_set = profile.get("RULESET") or (user_profile.upper() if isinstance(user_profile, str) else "")
@@ -331,34 +386,85 @@ def build_command_list(profiles: List[Dict[str, Any]]) -> Tuple[List[str], List[
                 continue
             bindings = binding_index.get(rule_name, [])
             try:
-                output_lines.extend(render_rule(rule_set, rule_name, rule_data, bindings))
+                rule_commands, thr_source, ref_chg = render_rule(rule_set, rule_name, rule_data, bindings)
+                safe_rule_name = normalize_rule_name(rule_name)
+                if output_lines and output_lines[-1] != "":
+                    output_lines.append("")
+                output_lines.append(f"# {rule_set} - {safe_rule_name}")
+                output_lines.extend(rule_commands)
+                if ref_chg not in emitted_charging_data:
+                    rating_group = rating_group_from_charge(ref_chg)
+                    charging_label = charging_data_label(ref_chg)
+                    output_lines.append(
+                        f"set SMFFunction Policy smfpolicy chargingData {charging_label} ratingGroup {rating_group}"
+                    )
+                    emitted_charging_data.add(ref_chg)
+                monitoring_key = monitoring_key_for_rule(rule_data)
+                usage_commands: List[str] = []
+                thr_usage: Dict[str, List[int]] = {}
+                thr_order: List[str] = []
+
+                def add_thr_usage(thr_tag: str, urr_id: int) -> None:
+                    if thr_tag not in thr_usage:
+                        thr_usage[thr_tag] = []
+                        thr_order.append(thr_tag)
+                    thr_usage[thr_tag].append(urr_id)
+
+                if monitoring_key is not None:
+                    monitoring_urr = next_monitoring_urr
+                    next_monitoring_urr += 1
+                    output_lines.append(
+                        f"set SMFFunction Policy smfpolicy ruleSets {rule_set} rules {safe_rule_name} monitoringKey {monitoring_key}"
+                    )
+                    add_thr_usage(f"thr_{thr_source}", monitoring_urr)
+                    usage_commands.append(
+                        f"set SMFFunction Policy smfpolicy usageReportRules {monitoring_urr} urrType UM"
+                    )
                 usage_thr = needs_dual_usage_reporting(rule_data)
                 if usage_thr:
                     online_id = next_online_urr
-                    offline_id = next_offline_urr
                     next_online_urr += 1
+                    offline_id = next_offline_urr
                     next_offline_urr += 1
-                    output_lines.append(
-                        f"set SMFFunction Policy smfpolicy trafficHandlingRules thr_{usage_thr} usageReportRules [ {online_id} {offline_id} ]"
-                    )
-                    output_lines.append(
+                    add_thr_usage(f"thr_{usage_thr}", online_id)
+                    add_thr_usage(f"thr_{usage_thr}", offline_id)
+                    usage_commands.append(
                         f"set SMFFunction Policy smfpolicy usageReportRules {online_id} urrType online"
                     )
-                    output_lines.append(
+                    usage_commands.append(
                         f"set SMFFunction Policy smfpolicy usageReportRules {offline_id} urrType offline"
                     )
-                    output_lines.append(
+                    usage_commands.append(
                         f"set SMFFunction Policy smfpolicy usageReportRules {offline_id} measurementMethod both"
                     )
-                    output_lines.append(
+                    usage_commands.append(
                         f"set SMFFunction Policy smfpolicy usageReportRules {offline_id} reportingTriggers [ LIUSA ]"
                     )
-                    output_lines.append(
+                    usage_commands.append(
                         f"set SMFFunction Policy smfpolicy usageReportRules {offline_id} linkedUrrId 1"
                     )
-                    output_lines.append(
+                    usage_commands.append(
                         f"set SMFFunction Policy smfpolicy usageReportRules {offline_id} udrProfileIndex 1"
                     )
+                for thr_tag in thr_order:
+                    ids = " ".join(str(value) for value in thr_usage[thr_tag])
+                    output_lines.append(
+                        f"set SMFFunction Policy smfpolicy trafficHandlingRules {thr_tag} usageReportRules [ {ids} ]"
+                    )
+                output_lines.extend(usage_commands)
+                filter_names = collect_filter_names(rule_data)
+                if filter_names:
+                    filter_block = " ".join(filter_names)
+                    output_lines.append(
+                        f"set SMFFunction Policy smfpolicy pccRules {safe_rule_name} pdrId {next_pdr_id}"
+                    )
+                    output_lines.append(
+                        f"set SMFFunction Policy smfpolicy pccRules {safe_rule_name} filterList [ {filter_block} ]"
+                    )
+                    output_lines.append(
+                        f"set SMFFunction Policy smfpolicy pccRules {safe_rule_name} trafficControlStatus enableBidirectional"
+                    )
+                    next_pdr_id += 1
                 output_lines.append("")
             except ValueError as exc:
                 errors.append(str(exc))
@@ -369,29 +475,43 @@ def build_command_list(profiles: List[Dict[str, Any]]) -> Tuple[List[str], List[
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Generate JSON and MAV commands from policy commands")
-    parser.add_argument("input", type=Path, help="Text file containing ADD commands")
-    parser.add_argument("-o", "--output", dest="json_output", type=Path, help="Path to write JSON output")
-    parser.add_argument("-m", "--mav-output", dest="commands_output", type=Path, help="Path to write MAV commands")
+    parser.add_argument("-i", "--input", dest="input_path", type=Path, help="Text file containing ADD commands")
+    parser.add_argument("legacy_input", nargs="?", type=Path, help=argparse.SUPPRESS)
+    parser.add_argument(
+        "-o",
+        "--output",
+        dest="commands_output",
+        type=Path,
+        help="Path to write MAV command output (defaults to <input>_MAV_<timestamp>.txt)",
+    )
     parser.add_argument(
         "-r",
         "--ruleset-map",
         dest="ruleset_map",
         type=Path,
-        default=Path("ruleset_mapping_template.json"),
+        default=DEFAULT_RULESET_MAP,
         help="JSON file describing ruleSet/userProfile mappings",
     )
     args = parser.parse_args()
 
-    data = parse_file(args.input)
+    input_path = args.input_path or args.legacy_input
+    if input_path is None:
+        parser.error("An input file must be specified via -i/--input")
+
+    data = parse_file(input_path)
     ruleset_entries = load_ruleset_map(args.ruleset_map)
     filtered_json, profiles, mapping_warnings = filter_profiles(data, ruleset_entries)
 
-    json_path = args.json_output or args.input.with_suffix(".json")
+    timestamp = datetime.now().strftime(TIMESTAMP_FORMAT)
+    default_base_name = DEFAULT_OUTPUT_TEMPLATE.format(stem=input_path.stem, timestamp=timestamp)
+    default_base = Path.cwd() / default_base_name
+    default_commands_path = default_base.with_suffix(".txt")
+    commands_path = args.commands_output or default_commands_path
+    json_path = commands_path.with_suffix(".json")
     json_path.write_text(json.dumps(filtered_json, indent=2, sort_keys=True), encoding="utf-8")
     print(f"JSON written to {json_path}")
 
     commands, errors = build_command_list(profiles)
-    commands_path = args.commands_output or Path("mav.txt")
     commands_path.write_text("\n".join(commands) + ("\n" if commands else ""), encoding="utf-8")
     print(f"Commands written to {commands_path}")
     for warning in mapping_warnings:
