@@ -6,7 +6,7 @@ import json
 import re
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 ATTR_REGEX = re.compile(r"(\w+)=\"([^\"]*)\"|(\w+)=([^,;]+)")
 TIMESTAMP_FORMAT = "%Y%m%d%H%M%S"
@@ -306,13 +306,6 @@ def rating_group_from_charge(charge_name: str) -> str:
     return "xxxxxxxxxx"
 
 
-def charging_data_label(charge_name: str) -> str:
-    match = re.match(r"^(.*?)(?:_\d+)$", charge_name)
-    if match:
-        return match.group(1)
-    return charge_name
-
-
 def needs_dual_usage_reporting(rule_data: Dict[str, Any]) -> Optional[str]:
     policy_group = rule_data.get("PCCPOLICYGRP")
     if not isinstance(policy_group, dict):
@@ -366,7 +359,6 @@ def build_command_list(profiles: List[Dict[str, Any]]) -> Tuple[List[str], List[
     next_offline_urr = 301
     next_monitoring_urr = 501
     next_pdr_id = 601
-    emitted_charging_data: Set[str] = set()
     for profile in profiles:
         user_profile = profile.get("USERPROFILENAME", "")
         rule_set = profile.get("RULESET") or (user_profile.upper() if isinstance(user_profile, str) else "")
@@ -392,13 +384,10 @@ def build_command_list(profiles: List[Dict[str, Any]]) -> Tuple[List[str], List[
                     output_lines.append("")
                 output_lines.append(f"# {rule_set} - {safe_rule_name}")
                 output_lines.extend(rule_commands)
-                if ref_chg not in emitted_charging_data:
-                    rating_group = rating_group_from_charge(ref_chg)
-                    charging_label = charging_data_label(ref_chg)
-                    output_lines.append(
-                        f"set SMFFunction Policy smfpolicy chargingData {charging_label} ratingGroup {rating_group}"
-                    )
-                    emitted_charging_data.add(ref_chg)
+                rating_group = rating_group_from_charge(ref_chg)
+                output_lines.append(
+                    f"set SMFFunction Policy smfpolicy chargingData {ref_chg} ratingGroup {rating_group}"
+                )
                 monitoring_key = monitoring_key_for_rule(rule_data)
                 usage_commands: List[str] = []
                 thr_usage: Dict[str, List[int]] = {}
