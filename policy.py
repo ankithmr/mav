@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Parse policy commands and emit structured JSON."""
+"""Parse style policy commands and emit structured JSON."""
 
 import argparse
 import json
@@ -8,6 +8,10 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 ATTR_REGEX = re.compile(r"(\w+)=\"([^\"]*)\"|(\w+)=([^,;]+)")
+
+
+def normalize_rule_name(name: str) -> str:
+    return name.replace("&", "_")
 
 
 def cast_value(raw: str) -> Any:
@@ -182,28 +186,19 @@ def parse_file(path: Path) -> Dict[str, Any]:
 
 def load_ruleset_map(path: Optional[Path]) -> List[Dict[str, Any]]:
     if path is None:
-        return []
+        raise SystemExit("A rule-set mapping file is required")
     try:
         mapping_text = path.read_text(encoding="utf-8")
     except FileNotFoundError:
-        return []
+        raise SystemExit(f"Rule-set mapping file not found: {path}")
     mapping_data = json.loads(mapping_text)
     entries = mapping_data.get("ruleSetMap", [])
-    return entries if isinstance(entries, list) else []
+    if not isinstance(entries, list):
+        raise SystemExit("ruleSetMap must be an array")
+    return entries
 
 
 def filter_profiles(data: Dict[str, Any], mapping: List[Dict[str, Any]]) -> Tuple[Dict[str, Any], List[Dict[str, Any]], List[str]]:
-    if not mapping:
-        profiles = []
-        for user_profile, payload in data.items():
-            profiles.append({
-                "USERPROFILENAME": user_profile,
-                "RULESET": user_profile.upper(),
-                "RULEBINDING": payload.get("RULEBINDING", []),
-                "RULE": payload.get("RULE", {}),
-            })
-        return data, profiles, []
-
     filtered_json: Dict[str, Any] = {}
     command_profiles: List[Dict[str, Any]] = []
     warnings: List[str] = []
@@ -229,14 +224,15 @@ def filter_profiles(data: Dict[str, Any], mapping: List[Dict[str, Any]]) -> Tupl
             if binding.get("RULENAME") in allowed_set
         ]
         profile_entry = {
-            "RULESET": rule_set,
             "RULEBINDING": filtered_bindings,
             "RULE": filtered_rules,
         }
         filtered_json[profile_name] = profile_entry
         command_profiles.append({
             "USERPROFILENAME": profile_name,
-            **profile_entry,
+            "RULESET": rule_set,
+            "RULEBINDING": filtered_bindings,
+            "RULE": filtered_rules,
         })
     return filtered_json, command_profiles, warnings
 
@@ -268,23 +264,54 @@ def refchg_and_thr(rule_name: str, rule_data: Dict[str, Any]) -> Tuple[str, str]
     return ref_chg, thr_source
 
 
+def needs_dual_usage_reporting(rule_data: Dict[str, Any]) -> Optional[str]:
+    policy_group = rule_data.get("PCCPOLICYGRP")
+    if not isinstance(policy_group, dict):
+        return None
+    charge = policy_group.get("CHARGEPROP")
+    if not isinstance(charge, dict):
+        return None
+    required_fields = [
+        "CHARGEPROPNAME",
+        "DOWNCBBIDNAME",
+        "UPCBBIDNAME",
+        "ONLDNCBBIDNAME",
+        "ONLUPCBBIDNAME",
+    ]
+    if not all(field in charge for field in required_fields):
+        return None
+    offline_down = charge.get("DOWNCBBIDNAME")
+    offline_up = charge.get("UPCBBIDNAME")
+    online_down = charge.get("ONLDNCBBIDNAME")
+    online_up = charge.get("ONLUPCBBIDNAME")
+    if offline_down == online_down and offline_up == online_up:
+        return None
+    thr_source = policy_group.get("PCCPOLICYGRPNM") or rule_data.get("POLICYNAME")
+    if not thr_source:
+        return None
+    return thr_source
+
+
 def render_rule(rule_set: str, rule_name: str, rule_data: Dict[str, Any], bindings: List[Dict[str, Any]]) -> List[str]:
     if not rule_set:
         raise ValueError(f"Rule {rule_name} missing ruleSet identifier")
     precedence = precedence_for_rule(rule_name, bindings, rule_data.get("PRIORITY"))
     ref_chg, thr_source = refchg_and_thr(rule_name, rule_data)
+    safe_rule_name = normalize_rule_name(rule_name)
     return [
-        f"set SMFFunction Policy smfpolicy ruleSets {rule_set} rules {rule_name} precedence {precedence}",
-        f"set SMFFunction Policy smfpolicy ruleSets {rule_set} rules {rule_name} refChgData {ref_chg}",
-        f"set SMFFunction Policy smfpolicy ruleSets {rule_set} rules {rule_name} trafficHandlingRules [ thr_{thr_source} ]",
-        f"set SMFFunction Policy smfpolicy ruleSets {rule_set} rules {rule_name} status active",
-        f"set SMFFunction Policy smfpolicy ruleSets {rule_set} rules {rule_name} tethering false",
+        f"set SMFFunction Policy smfpolicy ruleSets {rule_set} rules {safe_rule_name} precedence {precedence}",
+        f"set SMFFunction Policy smfpolicy ruleSets {rule_set} rules {safe_rule_name} refChgData {ref_chg}",
+        f"set SMFFunction Policy smfpolicy ruleSets {rule_set} rules {safe_rule_name} trafficHandlingRules [ thr_{thr_source} ]",
+        f"set SMFFunction Policy smfpolicy ruleSets {rule_set} rules {safe_rule_name} status active",
+        f"set SMFFunction Policy smfpolicy ruleSets {rule_set} rules {safe_rule_name} tethering false",
     ]
 
 
 def build_command_list(profiles: List[Dict[str, Any]]) -> Tuple[List[str], List[str]]:
     output_lines: List[str] = []
     errors: List[str] = []
+    next_online_urr = 101
+    next_offline_urr = 301
     for profile in profiles:
         user_profile = profile.get("USERPROFILENAME", "")
         rule_set = profile.get("RULESET") or (user_profile.upper() if isinstance(user_profile, str) else "")
@@ -305,6 +332,33 @@ def build_command_list(profiles: List[Dict[str, Any]]) -> Tuple[List[str], List[
             bindings = binding_index.get(rule_name, [])
             try:
                 output_lines.extend(render_rule(rule_set, rule_name, rule_data, bindings))
+                usage_thr = needs_dual_usage_reporting(rule_data)
+                if usage_thr:
+                    online_id = next_online_urr
+                    offline_id = next_offline_urr
+                    next_online_urr += 1
+                    next_offline_urr += 1
+                    output_lines.append(
+                        f"set SMFFunction Policy smfpolicy trafficHandlingRules thr_{usage_thr} usageReportRules [ {online_id} {offline_id} ]"
+                    )
+                    output_lines.append(
+                        f"set SMFFunction Policy smfpolicy usageReportRules {online_id} urrType online"
+                    )
+                    output_lines.append(
+                        f"set SMFFunction Policy smfpolicy usageReportRules {offline_id} urrType offline"
+                    )
+                    output_lines.append(
+                        f"set SMFFunction Policy smfpolicy usageReportRules {offline_id} measurementMethod both"
+                    )
+                    output_lines.append(
+                        f"set SMFFunction Policy smfpolicy usageReportRules {offline_id} reportingTriggers [ LIUSA ]"
+                    )
+                    output_lines.append(
+                        f"set SMFFunction Policy smfpolicy usageReportRules {offline_id} linkedUrrId 1"
+                    )
+                    output_lines.append(
+                        f"set SMFFunction Policy smfpolicy usageReportRules {offline_id} udrProfileIndex 1"
+                    )
                 output_lines.append("")
             except ValueError as exc:
                 errors.append(str(exc))
