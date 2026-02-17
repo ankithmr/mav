@@ -12,6 +12,17 @@ ATTR_REGEX = re.compile(r"(\w+)=\"([^\"]*)\"|(\w+)=([^,;]+)")
 TIMESTAMP_FORMAT = "%Y%m%d%H%M%S"
 DEFAULT_RULESET_MAP = Path("ruleset_mapping_template.json")
 DEFAULT_OUTPUT_TEMPLATE = "{stem}_MAV_{timestamp}"
+PROTOCOL_TOKENS = {
+    "ANY": "ip",
+    "IP": "ip",
+    "TCP": "6",
+    "UDP": "17",
+    "ICMP": "1",
+    "IGMP": "2",
+    "SCTP": "132",
+    "ESP": "50",
+    "AH": "51",
+}
 
 
 def normalize_rule_name(name: str) -> str:
@@ -101,7 +112,7 @@ def build_policy_group(name: str, policy_groups: Dict[str, Dict[str, Any]], char
     return result
 
 
-def parse_file(path: Path) -> Dict[str, Any]:
+def parse_file(path: Path) -> Tuple[Dict[str, Any], Dict[str, List[Dict[str, Any]]]]:
     lines = path.read_text(encoding="utf-8").splitlines()
     commands = collect_commands(lines)
 
@@ -112,6 +123,7 @@ def parse_file(path: Path) -> Dict[str, Any]:
     l7_filters: Dict[str, Dict[str, Any]] = {}
     policy_groups: Dict[str, Dict[str, Any]] = {}
     charge_props: Dict[str, Dict[str, Any]] = {}
+    ip_lists: Dict[str, List[Dict[str, Any]]] = {}
 
     for command in commands:
         if command.startswith("ADD RULEBINDING"):
@@ -157,6 +169,12 @@ def parse_file(path: Path) -> Dict[str, Any]:
             name = attrs.get("CHARGEPROPNAME")
             if name:
                 charge_props[name] = attrs
+        elif command.startswith("ADD IPLIST"):
+            attrs = parse_attributes(command)
+            name = attrs.get("IPLISTNAME")
+            if name:
+                entry = {k: v for k, v in attrs.items() if k != "IPLISTNAME"}
+                ip_lists.setdefault(name, []).append(entry)
 
     output: Dict[str, Any] = {}
     for binding in rule_bindings:
@@ -185,7 +203,7 @@ def parse_file(path: Path) -> Dict[str, Any]:
                 if policy_group:
                     rule_payload["PCCPOLICYGRP"] = policy_group
             profile_entry["RULE"][rule_name] = rule_payload
-    return output
+    return output, ip_lists
 
 
 def load_ruleset_map(path: Optional[Path]) -> List[Dict[str, Any]]:
@@ -299,6 +317,137 @@ def collect_filter_names(rule_data: Dict[str, Any]) -> List[str]:
     return deduped
 
 
+def protocol_token(value: Any) -> str:
+    if isinstance(value, str):
+        lookup = PROTOCOL_TOKENS.get(value.upper())
+        if lookup:
+            return lookup
+        return value.lower()
+    if isinstance(value, (int, float)):
+        return str(int(value))
+    return "ip"
+
+
+def netmask_to_prefix(mask: str) -> Optional[int]:
+    try:
+        parts = [int(part) for part in mask.split(".")]
+    except ValueError:
+        return None
+    if len(parts) != 4:
+        return None
+    binary = "".join(f"{part:08b}" for part in parts)
+    return binary.count("1")
+
+
+def format_ip_with_mask(
+    ip: Optional[str], mask_type: Optional[str], mask_value: Optional[Any], mask_len: Optional[Any]
+) -> Optional[str]:
+    if not isinstance(ip, str) or not ip:
+        return None
+    suffix = ""
+    if isinstance(mask_type, str):
+        mask_type_upper = mask_type.upper()
+        if mask_type_upper == "LENGTHTYPE" and isinstance(mask_len, int):
+            suffix = f"/{mask_len}"
+        elif mask_type_upper == "IPTYPE" and isinstance(mask_value, str) and mask_value != "0.0.0.0":
+            prefix = netmask_to_prefix(mask_value)
+            if prefix is not None:
+                suffix = f"/{prefix}"
+    return f"{ip}{suffix}"
+
+
+def format_ip_list_entry(entry: Dict[str, Any]) -> Optional[str]:
+    ip = entry.get("IPV4ADDR") or entry.get("IPV6ADDR")
+    if not isinstance(ip, str):
+        return None
+    mask_value = entry.get("MASKVALUE")
+    if isinstance(mask_value, int):
+        return f"{ip}/{mask_value}"
+    return ip
+
+
+def resolve_ip_targets(prefix: str, filter_data: Dict[str, Any], ip_lists: Dict[str, List[Dict[str, Any]]]) -> List[str]:
+    mode = filter_data.get(f"{prefix}IPMODE")
+    mode_upper = mode.upper() if isinstance(mode, str) else ""
+    if not mode_upper or mode_upper == "ANY":
+        return ["any"]
+    if mode_upper == "IP":
+        desc = format_ip_with_mask(
+            filter_data.get(f"{prefix}IP"),
+            filter_data.get(f"{prefix}IPMASKTYPE"),
+            filter_data.get(f"{prefix}IPMASK"),
+            filter_data.get(f"{prefix}IPMASKLEN"),
+        )
+        return [desc or "any"]
+    if mode_upper == "IPLIST":
+        list_name = filter_data.get(f"{prefix}IPLISTNAME")
+        entries = ip_lists.get(list_name, [])
+        resolved = [value for value in (format_ip_list_entry(entry) for entry in entries) if value]
+        if resolved:
+            return resolved
+        return [list_name or "any"]
+    if mode_upper == "IPRANGE":
+        start = filter_data.get(f"{prefix}IPSTART")
+        end = filter_data.get(f"{prefix}IPEND")
+        if isinstance(start, str) and isinstance(end, str):
+            return [f"{start}-{end}"]
+    return ["any"]
+
+
+def format_port_suffix(start: Any, end: Any) -> str:
+    if not isinstance(start, int) or not isinstance(end, int):
+        return ""
+    if start == 0 and end == 65535:
+        return ""
+    if start == end:
+        return f" {start}"
+    return f" {start}-{end}"
+
+
+def format_filter_statements(filter_data: Dict[str, Any], ip_lists: Dict[str, List[Dict[str, Any]]]) -> List[str]:
+    proto = protocol_token(filter_data.get("L34PROTOCOL"))
+    server_targets = resolve_ip_targets("SVR", filter_data, ip_lists)
+    ue_targets = resolve_ip_targets("MS", filter_data, ip_lists)
+    server_port_suffix = format_port_suffix(filter_data.get("SVRSTARTPORT"), filter_data.get("SVRENDPORT"))
+    ue_port_suffix = format_port_suffix(filter_data.get("MSSTARTPORT"), filter_data.get("MSENDPORT"))
+    statements: List[str] = []
+    for server in server_targets or ["any"]:
+        srv_desc = server or "any"
+        for ue in ue_targets or ["any"]:
+            ue_desc = ue or "any"
+            statements.append(
+                f"permit out {proto} from {srv_desc}{server_port_suffix} to {ue_desc}{ue_port_suffix}"
+            )
+    return statements
+
+
+def build_filter_commands(
+    filters: Dict[str, Dict[str, Any]], ip_lists: Dict[str, List[Dict[str, Any]]]
+) -> List[str]:
+    if not filters:
+        return ["# No L3/L4 filters referenced"]
+    lines: List[str] = []
+    for name, payload in filters.items():
+        statements = format_filter_statements(payload, ip_lists)
+        if not statements:
+            continue
+        lines.append(f"# {name}")
+        for description in statements:
+            lines.append(
+                f"set UPFFunction Policy upfpolicy packetFilters {name} flowInfo flowDescription \"{description}\""
+            )
+        lines.append(
+            f"set UPFFunction Policy upfpolicy packetFilters {name} flowInfo flowDirection bidirectional"
+        )
+        lines.append(
+            f"set UPFFunction Policy upfpolicy packetFilters {name} flowInfo packetFilterUsage true"
+        )
+        lines.append("")
+    if lines:
+        lines.pop()
+    return lines or ["# No L3/L4 filters referenced"]
+
+
 def rating_group_from_charge(charge_name: str) -> str:
     match = re.search(r"(\d+)$", charge_name)
     if match:
@@ -352,13 +501,16 @@ def render_rule(
     return commands, thr_source, ref_chg
 
 
-def build_command_list(profiles: List[Dict[str, Any]]) -> Tuple[List[str], List[str]]:
+def build_command_list(
+    profiles: List[Dict[str, Any]], ip_lists: Dict[str, List[Dict[str, Any]]]
+) -> Tuple[List[str], List[str], List[str]]:
     output_lines: List[str] = []
     errors: List[str] = []
     next_online_urr = 101
     next_offline_urr = 301
     next_monitoring_urr = 501
     next_pdr_id = 601
+    collected_filters: Dict[str, Dict[str, Any]] = {}
     for profile in profiles:
         user_profile = profile.get("USERPROFILENAME", "")
         rule_set = profile.get("RULESET") or (user_profile.upper() if isinstance(user_profile, str) else "")
@@ -442,6 +594,17 @@ def build_command_list(profiles: List[Dict[str, Any]]) -> Tuple[List[str], List[
                     )
                 output_lines.extend(usage_commands)
                 filter_names = collect_filter_names(rule_data)
+                for filter_entry in rule_data.get("FLTBINDFLOWF", []) or []:
+                    if not isinstance(filter_entry, dict):
+                        continue
+                    filter_name = filter_entry.get("FILTERNAME")
+                    filter_payload = filter_entry.get("FILTER")
+                    if (
+                        isinstance(filter_name, str)
+                        and isinstance(filter_payload, dict)
+                        and filter_name not in collected_filters
+                    ):
+                        collected_filters[filter_name] = filter_payload
                 if filter_names:
                     filter_block = " ".join(filter_names)
                     output_lines.append(
@@ -457,9 +620,25 @@ def build_command_list(profiles: List[Dict[str, Any]]) -> Tuple[List[str], List[
                 output_lines.append("")
             except ValueError as exc:
                 errors.append(str(exc))
+    if collected_filters:
+        if output_lines and output_lines[-1] != "":
+            output_lines.append("")
+        output_lines.append("# Packet filter definitions")
+        for filter_name in collected_filters:
+            output_lines.append(
+                f"set SMFFunction Policy smfpolicy packetFilters {filter_name} flowInfo flowDescription \"permit out ip from any to assigned\""
+            )
+            output_lines.append(
+                f"set SMFFunction Policy smfpolicy packetFilters {filter_name} flowInfo flowDirection bidirectional"
+            )
+            output_lines.append(
+                f"set SMFFunction Policy smfpolicy packetFilters {filter_name} flowInfo packetFilterUsage false"
+            )
+            output_lines.append("")
     if output_lines:
         output_lines.pop()
-    return output_lines, errors
+    filter_commands = build_filter_commands(collected_filters, ip_lists)
+    return output_lines, filter_commands, errors
 
 
 def main() -> None:
@@ -487,7 +666,7 @@ def main() -> None:
     if input_path is None:
         parser.error("An input file must be specified via -i/--input")
 
-    data = parse_file(input_path)
+    data, ip_lists = parse_file(input_path)
     ruleset_entries = load_ruleset_map(args.ruleset_map)
     filtered_json, profiles, mapping_warnings = filter_profiles(data, ruleset_entries)
 
@@ -500,9 +679,12 @@ def main() -> None:
     json_path.write_text(json.dumps(filtered_json, indent=2, sort_keys=True), encoding="utf-8")
     print(f"JSON written to {json_path}")
 
-    commands, errors = build_command_list(profiles)
+    commands, filter_commands, errors = build_command_list(profiles, ip_lists)
     commands_path.write_text("\n".join(commands) + ("\n" if commands else ""), encoding="utf-8")
     print(f"Commands written to {commands_path}")
+    filters_path = Path.cwd() / f"{input_path.stem}_UPF_Filters_{timestamp}.txt"
+    filters_path.write_text("\n".join(filter_commands) + ("\n" if filter_commands else ""), encoding="utf-8")
+    print(f"Filters written to {filters_path}")
     for warning in mapping_warnings:
         print(f"Mapping warning: {warning}")
     if errors:
