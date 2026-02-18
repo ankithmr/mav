@@ -510,7 +510,7 @@ def render_rule(
         f"set SMFFunction Policy smfpolicy ruleSets {rule_set} rules {safe_rule_name} status active",
         f"set SMFFunction Policy smfpolicy ruleSets {rule_set} rules {safe_rule_name} tethering false",
     ]
-    return commands, thr_source, ref_chg
+    return commands, thr_identifier, ref_chg
 
 
 def build_command_list(
@@ -542,9 +542,8 @@ def build_command_list(
                 continue
             bindings = binding_index.get(rule_name, [])
             try:
-                rule_commands, thr_source, ref_chg = render_rule(rule_set, rule_name, rule_data, bindings)
+                rule_commands, thr_identifier, ref_chg = render_rule(rule_set, rule_name, rule_data, bindings)
                 safe_rule_name = normalize_rule_name(rule_name)
-                thr_base_tag = f"thr_{sanitize_identifier(thr_source)}"
                 if output_lines and output_lines[-1] != "":
                     output_lines.append("")
                 output_lines.append(f"# {rule_set} - {safe_rule_name}")
@@ -570,7 +569,7 @@ def build_command_list(
                     output_lines.append(
                         f"set SMFFunction Policy smfpolicy ruleSets {rule_set} rules {safe_rule_name} monitoringKey {monitoring_key}"
                     )
-                    add_thr_usage(thr_base_tag, monitoring_urr)
+                    add_thr_usage(thr_identifier, monitoring_urr)
                     usage_commands.append(
                         f"set SMFFunction Policy smfpolicy usageReportRules {monitoring_urr} urrType UM"
                     )
@@ -580,9 +579,8 @@ def build_command_list(
                     next_online_urr += 1
                     offline_id = next_offline_urr
                     next_offline_urr += 1
-                    usage_thr_tag = f"thr_{sanitize_identifier(usage_thr)}"
-                    add_thr_usage(usage_thr_tag, online_id)
-                    add_thr_usage(usage_thr_tag, offline_id)
+                    add_thr_usage(thr_identifier, online_id)
+                    add_thr_usage(thr_identifier, offline_id)
                     usage_commands.append(
                         f"set SMFFunction Policy smfpolicy usageReportRules {online_id} urrType online"
                     )
