@@ -37,6 +37,43 @@ def sanitize_identifier(value: Any) -> str:
     return sanitized or "_"
 
 
+def parse_bool_flag(value: Any, default: bool = True) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"true", "yes", "1"}:
+            return True
+        if lowered in {"false", "no", "0"}:
+            return False
+    return default
+
+
+def default_usage_flags() -> Dict[str, bool]:
+    return {"online": True, "offline": True, "monitoring": True}
+
+
+def extract_rule_name(entry: Any) -> Optional[str]:
+    if isinstance(entry, str):
+        return entry
+    if isinstance(entry, dict):
+        name = entry.get("ruleName") or entry.get("name")
+        if isinstance(name, str):
+            return name
+    return None
+
+
+def extract_usage_flags(entry: Dict[str, Any]) -> Dict[str, bool]:
+    flags = default_usage_flags()
+    usage_block = entry.get("usage")
+    for key in flags:
+        if key in entry:
+            flags[key] = parse_bool_flag(entry[key], flags[key])
+        elif isinstance(usage_block, dict) and key in usage_block:
+            flags[key] = parse_bool_flag(usage_block[key], flags[key])
+    return flags
+
+
 def cast_value(raw: str) -> Any:
     if raw.isdigit():
         return int(raw)
@@ -242,7 +279,11 @@ def filter_profiles(data: Dict[str, Any], mapping: List[Dict[str, Any]]) -> Tupl
         if not profile_data:
             warnings.append(f"Profile {profile_name} not found in source commands")
             continue
-        allowed_set = {name for name in allowed_rules if isinstance(name, str)}
+        allowed_set = {
+            name
+            for name in (extract_rule_name(rule_entry) for rule_entry in allowed_rules)
+            if isinstance(name, str)
+        }
         rule_payload = profile_data.get("RULE", {}) or {}
         filtered_rules = {name: payload for name, payload in rule_payload.items() if name in allowed_set}
         if not filtered_rules:
@@ -253,6 +294,7 @@ def filter_profiles(data: Dict[str, Any], mapping: List[Dict[str, Any]]) -> Tupl
             for binding in profile_data.get("RULEBINDING", []) or []
             if binding.get("RULENAME") in allowed_set
         ]
+        usage_flags = extract_usage_flags(entry)
         profile_entry = {
             "RULEBINDING": filtered_bindings,
             "RULE": filtered_rules,
@@ -263,6 +305,7 @@ def filter_profiles(data: Dict[str, Any], mapping: List[Dict[str, Any]]) -> Tupl
             "RULESET": rule_set,
             "RULEBINDING": filtered_bindings,
             "RULE": filtered_rules,
+            "USAGE_FLAGS": usage_flags,
         })
     return filtered_json, command_profiles, warnings
 
@@ -527,6 +570,7 @@ def build_command_list(
         user_profile = profile.get("USERPROFILENAME", "")
         rule_set = profile.get("RULESET") or (user_profile.upper() if isinstance(user_profile, str) else "")
         rule_map = profile.get("RULE", {})
+        usage_flags = profile.get("USAGE_FLAGS") or default_usage_flags()
         if not isinstance(user_profile, str) or not isinstance(rule_map, dict):
             continue
         binding_index: Dict[str, List[Dict[str, Any]]] = {}
@@ -544,6 +588,9 @@ def build_command_list(
             try:
                 rule_commands, thr_identifier, ref_chg = render_rule(rule_set, rule_name, rule_data, bindings)
                 safe_rule_name = normalize_rule_name(rule_name)
+                monitoring_enabled = usage_flags.get("monitoring", True)
+                online_enabled = usage_flags.get("online", True)
+                offline_enabled = usage_flags.get("offline", True)
                 if output_lines and output_lines[-1] != "":
                     output_lines.append("")
                 output_lines.append(f"# {rule_set} - {safe_rule_name}")
@@ -563,7 +610,7 @@ def build_command_list(
                         thr_order.append(thr_tag)
                     thr_usage[thr_tag].append(urr_id)
 
-                if monitoring_key is not None:
+                if monitoring_enabled and monitoring_key is not None:
                     monitoring_urr = next_monitoring_urr
                     next_monitoring_urr += 1
                     output_lines.append(
@@ -574,31 +621,33 @@ def build_command_list(
                         f"set SMFFunction Policy smfpolicy usageReportRules {monitoring_urr} urrType UM"
                     )
                 usage_thr = needs_dual_usage_reporting(rule_data)
-                if usage_thr:
-                    online_id = next_online_urr
-                    next_online_urr += 1
-                    offline_id = next_offline_urr
-                    next_offline_urr += 1
-                    add_thr_usage(thr_identifier, online_id)
-                    add_thr_usage(thr_identifier, offline_id)
-                    usage_commands.append(
-                        f"set SMFFunction Policy smfpolicy usageReportRules {online_id} urrType online"
-                    )
-                    usage_commands.append(
-                        f"set SMFFunction Policy smfpolicy usageReportRules {offline_id} urrType offline"
-                    )
-                    usage_commands.append(
-                        f"set SMFFunction Policy smfpolicy usageReportRules {offline_id} measurementMethod both"
-                    )
-                    usage_commands.append(
-                        f"set SMFFunction Policy smfpolicy usageReportRules {offline_id} reportingTriggers [ LIUSA ]"
-                    )
-                    usage_commands.append(
-                        f"set SMFFunction Policy smfpolicy usageReportRules {offline_id} linkedUrrId 1"
-                    )
-                    usage_commands.append(
-                        f"set SMFFunction Policy smfpolicy usageReportRules {offline_id} udrProfileIndex 1"
-                    )
+                if usage_thr and (online_enabled or offline_enabled):
+                    if online_enabled:
+                        online_id = next_online_urr
+                        next_online_urr += 1
+                        add_thr_usage(thr_identifier, online_id)
+                        usage_commands.append(
+                            f"set SMFFunction Policy smfpolicy usageReportRules {online_id} urrType online"
+                        )
+                    if offline_enabled:
+                        offline_id = next_offline_urr
+                        next_offline_urr += 1
+                        add_thr_usage(thr_identifier, offline_id)
+                        usage_commands.append(
+                            f"set SMFFunction Policy smfpolicy usageReportRules {offline_id} urrType offline"
+                        )
+                        usage_commands.append(
+                            f"set SMFFunction Policy smfpolicy usageReportRules {offline_id} measurementMethod both"
+                        )
+                        usage_commands.append(
+                            f"set SMFFunction Policy smfpolicy usageReportRules {offline_id} reportingTriggers [ LIUSA ]"
+                        )
+                        usage_commands.append(
+                            f"set SMFFunction Policy smfpolicy usageReportRules {offline_id} linkedUrrId 1"
+                        )
+                        usage_commands.append(
+                            f"set SMFFunction Policy smfpolicy usageReportRules {offline_id} udrProfileIndex 1"
+                        )
                 for thr_tag in thr_order:
                     ids = " ".join(str(value) for value in thr_usage[thr_tag])
                     output_lines.append(
