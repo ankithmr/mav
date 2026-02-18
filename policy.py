@@ -6,7 +6,7 @@ import json
 import re
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 ATTR_REGEX = re.compile(r"(\w+)=\"([^\"]*)\"|(\w+)=([^,;]+)")
 TIMESTAMP_FORMAT = "%Y%m%d%H%M%S"
@@ -128,7 +128,7 @@ def build_flow_filter(name: str, bindings: Dict[str, Dict[str, List[Any]]], filt
     if entry.get("filters"):
         flow_filter["FLTBINDFLOWF"] = []
         for filter_name in entry["filters"]:
-            filter_info: Dict[str, Any] = {"FILTERNAME": filter_name}
+            filter_info: Dict[str, Any] = {"FILTERNAME": filter_name, "FLOWFILTERNAME": name}
             definition = filters.get(filter_name)
             if definition:
                 filter_info["FILTER"] = {k: v for k, v in definition.items() if k != "FILTERNAME"}
@@ -477,26 +477,50 @@ def build_filter_commands(
 ) -> List[str]:
     if not filters:
         return ["# No L3/L4 filters referenced"]
-    lines: List[str] = []
-    for name, payload in filters.items():
+    flow_groups: Dict[str, List[str]] = {}
+    filter_lines: List[str] = []
+    for name, entry in filters.items():
+        payload = entry.get("payload") or {}
         statements = format_filter_statements(payload, ip_lists)
         if not statements:
             continue
-        lines.append(f"# {name}")
+        flow_names = sorted(entry.get("flows") or [])
+        for flow_name in flow_names:
+            members = flow_groups.setdefault(flow_name, [])
+            members.append(name)
+        filter_lines.append(f"# {name}")
         for description in statements:
-            lines.append(
+            filter_lines.append(
                 f"set UPFFunction Policy upfpolicy packetFilters {name} flowInfo flowDescription \"{description}\""
             )
-        lines.append(
+        filter_lines.append(
             f"set UPFFunction Policy upfpolicy packetFilters {name} flowInfo flowDirection bidirectional"
         )
-        lines.append(
+        filter_lines.append(
             f"set UPFFunction Policy upfpolicy packetFilters {name} flowInfo packetFilterUsage true"
         )
-        lines.append("")
-    if lines:
-        lines.pop()
-    return lines or ["# No L3/L4 filters referenced"]
+        filter_lines.append("")
+    if filter_lines:
+        filter_lines.pop()
+    if not flow_groups and not filter_lines:
+        return ["# No L3/L4 filters referenced"]
+    result: List[str] = []
+    if flow_groups:
+        result.append("# Packet filter group assignments")
+        for flow_name in sorted(flow_groups):
+            filters_for_flow = flow_groups[flow_name]
+            result.append(f"# Flow filter {flow_name}")
+            for filter_name in filters_for_flow:
+                result.append(
+                    f"set UPFFunction Policy upfpolicy packetFilterGroups {flow_name} filterList {filter_name}"
+                )
+            result.append("")
+        if result and result[-1] == "":
+            result.pop()
+        if filter_lines:
+            result.append("")
+    result.extend(filter_lines)
+    return result or ["# No L3/L4 filters referenced"]
 
 
 def rating_group_from_charge(charge_name: str) -> str:
@@ -669,8 +693,16 @@ def build_command_list(
                     filter_payload = filter_entry.get("FILTER")
                     if isinstance(filter_name, str) and isinstance(filter_payload, dict):
                         sanitized_filter_name = sanitize_identifier(filter_name)
-                        if sanitized_filter_name not in collected_filters:
-                            collected_filters[sanitized_filter_name] = filter_payload
+                        entry = collected_filters.setdefault(
+                            sanitized_filter_name,
+                            {"payload": filter_payload, "flows": set()},
+                        )
+                        if "payload" not in entry or not entry["payload"]:
+                            entry["payload"] = filter_payload
+                        flow_name_value = filter_entry.get("FLOWFILTERNAME") or rule_data.get("FLOWFILTERNAME")
+                        if isinstance(flow_name_value, str):
+                            sanitized_flow = sanitize_identifier(flow_name_value)
+                            entry.setdefault("flows", set()).add(sanitized_flow)
                 if sanitized_filter_names:
                     filter_block = " ".join(sanitized_filter_names)
                     output_lines.append(
