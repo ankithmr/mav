@@ -29,6 +29,14 @@ def normalize_rule_name(name: str) -> str:
     return name.replace("&", "_")
 
 
+def sanitize_identifier(value: Any) -> str:
+    """Replace non-word characters with underscores for policy identifiers."""
+    text = value if isinstance(value, str) else str(value or "")
+    sanitized = re.sub(r"[^\w]", "_", text)
+    sanitized = re.sub(r"_+", "_", sanitized)
+    return sanitized or "_"
+
+
 def cast_value(raw: str) -> Any:
     if raw.isdigit():
         return int(raw)
@@ -491,10 +499,14 @@ def render_rule(
     precedence = precedence_for_rule(rule_name, bindings, rule_data.get("PRIORITY"))
     ref_chg, thr_source = refchg_and_thr(rule_name, rule_data)
     safe_rule_name = normalize_rule_name(rule_name)
+    thr_source_token = sanitize_identifier(thr_source)
+    rule_set_token = sanitize_identifier(rule_set)
+    thr_rule_token = sanitize_identifier(safe_rule_name)
+    thr_identifier = f"thr_{thr_source_token}_{rule_set_token}_{thr_rule_token}"
     commands = [
         f"set SMFFunction Policy smfpolicy ruleSets {rule_set} rules {safe_rule_name} precedence {precedence}",
         f"set SMFFunction Policy smfpolicy ruleSets {rule_set} rules {safe_rule_name} refChgData {ref_chg}",
-        f"set SMFFunction Policy smfpolicy ruleSets {rule_set} rules {safe_rule_name} trafficHandlingRules [ thr_{thr_source} ]",
+        f"set SMFFunction Policy smfpolicy ruleSets {rule_set} rules {safe_rule_name} trafficHandlingRules [ {thr_identifier} ]",
         f"set SMFFunction Policy smfpolicy ruleSets {rule_set} rules {safe_rule_name} status active",
         f"set SMFFunction Policy smfpolicy ruleSets {rule_set} rules {safe_rule_name} tethering false",
     ]
@@ -532,6 +544,7 @@ def build_command_list(
             try:
                 rule_commands, thr_source, ref_chg = render_rule(rule_set, rule_name, rule_data, bindings)
                 safe_rule_name = normalize_rule_name(rule_name)
+                thr_base_tag = f"thr_{sanitize_identifier(thr_source)}"
                 if output_lines and output_lines[-1] != "":
                     output_lines.append("")
                 output_lines.append(f"# {rule_set} - {safe_rule_name}")
@@ -557,7 +570,7 @@ def build_command_list(
                     output_lines.append(
                         f"set SMFFunction Policy smfpolicy ruleSets {rule_set} rules {safe_rule_name} monitoringKey {monitoring_key}"
                     )
-                    add_thr_usage(f"thr_{thr_source}", monitoring_urr)
+                    add_thr_usage(thr_base_tag, monitoring_urr)
                     usage_commands.append(
                         f"set SMFFunction Policy smfpolicy usageReportRules {monitoring_urr} urrType UM"
                     )
@@ -567,8 +580,9 @@ def build_command_list(
                     next_online_urr += 1
                     offline_id = next_offline_urr
                     next_offline_urr += 1
-                    add_thr_usage(f"thr_{usage_thr}", online_id)
-                    add_thr_usage(f"thr_{usage_thr}", offline_id)
+                    usage_thr_tag = f"thr_{sanitize_identifier(usage_thr)}"
+                    add_thr_usage(usage_thr_tag, online_id)
+                    add_thr_usage(usage_thr_tag, offline_id)
                     usage_commands.append(
                         f"set SMFFunction Policy smfpolicy usageReportRules {online_id} urrType online"
                     )
@@ -594,19 +608,24 @@ def build_command_list(
                     )
                 output_lines.extend(usage_commands)
                 filter_names = collect_filter_names(rule_data)
+                sanitized_filter_names: List[str] = []
+                seen_sanitized_filters = set()
+                for name in filter_names:
+                    sanitized_name = sanitize_identifier(name)
+                    if sanitized_name not in seen_sanitized_filters:
+                        seen_sanitized_filters.add(sanitized_name)
+                        sanitized_filter_names.append(sanitized_name)
                 for filter_entry in rule_data.get("FLTBINDFLOWF", []) or []:
                     if not isinstance(filter_entry, dict):
                         continue
                     filter_name = filter_entry.get("FILTERNAME")
                     filter_payload = filter_entry.get("FILTER")
-                    if (
-                        isinstance(filter_name, str)
-                        and isinstance(filter_payload, dict)
-                        and filter_name not in collected_filters
-                    ):
-                        collected_filters[filter_name] = filter_payload
-                if filter_names:
-                    filter_block = " ".join(filter_names)
+                    if isinstance(filter_name, str) and isinstance(filter_payload, dict):
+                        sanitized_filter_name = sanitize_identifier(filter_name)
+                        if sanitized_filter_name not in collected_filters:
+                            collected_filters[sanitized_filter_name] = filter_payload
+                if sanitized_filter_names:
+                    filter_block = " ".join(sanitized_filter_names)
                     output_lines.append(
                         f"set SMFFunction Policy smfpolicy pccRules {safe_rule_name} pdrId {next_pdr_id}"
                     )
