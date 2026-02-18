@@ -1,0 +1,28 @@
+{
+  "ruleSetMap": [
+    {
+      "ruleSet": "RULESET_NAME",
+      "userProfileName": "user.profile",
+      "usage": {
+        "online": true,
+        "offline": true,
+        "monitoring": true
+      },
+      "rules": [
+        "rule_one",
+        "rule_two"
+      ]
+    },
+    {
+      "ruleSet": "ANOTHER_RULESET",
+      "userProfileName": "another.profile",
+      "online": false,
+      "offline": true,
+      "monitoring": false,
+      "rules": [
+        "example_rule_a",
+        "example_rule_b"
+      ]
+    }
+  ]
+}
