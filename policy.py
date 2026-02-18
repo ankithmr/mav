@@ -11,7 +11,7 @@ from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 ATTR_REGEX = re.compile(r"(\w+)=\"([^\"]*)\"|(\w+)=([^,;]+)")
 TIMESTAMP_FORMAT = "%Y%m%d%H%M%S"
 DEFAULT_RULESET_MAP = Path("ruleset_mapping_template.json")
-DEFAULT_OUTPUT_TEMPLATE = "{stem}_MAV_{timestamp}"
+DEFAULT_OUTPUT_TEMPLATE = "{stem}_MAV_SMF_{timestamp}"
 PROTOCOL_TOKENS = {
     "ANY": "ip",
     "IP": "ip",
@@ -582,7 +582,7 @@ def render_rule(
 
 def build_command_list(
     profiles: List[Dict[str, Any]], ip_lists: Dict[str, List[Dict[str, Any]]]
-) -> Tuple[List[str], List[str], List[str]]:
+) -> Tuple[List[str], List[str], List[str], Dict[str, str]]:
     output_lines: List[str] = []
     errors: List[str] = []
     next_online_urr = 101
@@ -590,6 +590,7 @@ def build_command_list(
     next_monitoring_urr = 501
     next_pdr_id = 601
     collected_filters: Dict[str, Dict[str, Any]] = {}
+    rule_flow_groups: Dict[str, str] = {}
     for profile in profiles:
         user_profile = profile.get("USERPROFILENAME", "")
         rule_set = profile.get("RULESET") or (user_profile.upper() if isinstance(user_profile, str) else "")
@@ -612,6 +613,9 @@ def build_command_list(
             try:
                 rule_commands, thr_identifier, ref_chg = render_rule(rule_set, rule_name, rule_data, bindings)
                 safe_rule_name = normalize_rule_name(rule_name)
+                flow_filter_name = rule_data.get("FLOWFILTERNAME")
+                if isinstance(flow_filter_name, str):
+                    rule_flow_groups[safe_rule_name] = sanitize_identifier(flow_filter_name)
                 monitoring_enabled = usage_flags.get("monitoring", True)
                 online_enabled = usage_flags.get("online", True)
                 offline_enabled = usage_flags.get("offline", True)
@@ -736,7 +740,40 @@ def build_command_list(
     if output_lines:
         output_lines.pop()
     filter_commands = build_filter_commands(collected_filters, ip_lists)
-    return output_lines, filter_commands, errors
+    return output_lines, filter_commands, errors, rule_flow_groups
+
+
+def transform_upf_commands(commands: List[str], rule_flow_groups: Dict[str, str]) -> List[str]:
+    upf_lines: List[str] = []
+    filter_pattern = re.compile(
+        r"set UPFFunction Policy upfpolicy pccRules (?P<rule>\S+) filterList \[ .* \]"
+    )
+    for line in commands:
+        upf_line = line.replace("SMFFunction", "UPFFunction").replace("smfpolicy", "upfpolicy")
+        if "udrProfileIndex" in upf_line:
+            continue
+        if "measurementMethod both" in upf_line:
+            continue
+        match = filter_pattern.match(upf_line)
+        if match:
+            rule_name = match.group("rule")
+            flow_group = rule_flow_groups.get(rule_name)
+            if flow_group:
+                upf_line = (
+                    f"set UPFFunction Policy upfpolicy pccRules {rule_name} filterGroups [ {flow_group} ]"
+                )
+        upf_lines.append(upf_line)
+        if "usageReportRules" in upf_line and "urrType" in upf_line and "offline" in upf_line:
+            urr_match = re.search(r"usageReportRules\s+(\d+)", upf_line)
+            if urr_match:
+                urr_id = urr_match.group(1)
+                upf_lines.append(
+                    f"set UPFFunction Policy upfpolicy usageReportRules {urr_id} measurementMethod volume"
+                )
+                upf_lines.append(
+                    f"set UPFFunction Policy upfpolicy usageReportRules {urr_id} measurementMethod duration"
+                )
+    return upf_lines
 
 
 def main() -> None:
@@ -777,9 +814,15 @@ def main() -> None:
     json_path.write_text(json.dumps(filtered_json, indent=2, sort_keys=True), encoding="utf-8")
     print(f"JSON written to {json_path}")
 
-    commands, filter_commands, errors = build_command_list(profiles, ip_lists)
-    commands_path.write_text("\n".join(commands) + ("\n" if commands else ""), encoding="utf-8")
+    commands, filter_commands, errors, rule_flow_groups = build_command_list(profiles, ip_lists)
+    command_payload = "\n".join(commands)
+    commands_path.write_text(command_payload + ("\n" if command_payload else ""), encoding="utf-8")
     print(f"Commands written to {commands_path}")
+    upf_commands_path = Path.cwd() / f"{input_path.stem}_MAV_UPF_{timestamp}.txt"
+    upf_commands = transform_upf_commands(commands, rule_flow_groups)
+    upf_payload = "\n".join(upf_commands)
+    upf_commands_path.write_text(upf_payload + ("\n" if upf_payload else ""), encoding="utf-8")
+    print(f"UPF commands written to {upf_commands_path}")
     filters_path = Path.cwd() / f"{input_path.stem}_UPF_Filters_{timestamp}.txt"
     filters_path.write_text("\n".join(filter_commands) + ("\n" if filter_commands else ""), encoding="utf-8")
     print(f"Filters written to {filters_path}")
